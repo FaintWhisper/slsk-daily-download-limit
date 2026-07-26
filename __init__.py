@@ -29,6 +29,11 @@ class Plugin(BasePlugin):
             "ban_username": True,
             "ban_ip_address": True,
             "exempt_buddies": False,
+            "send_limit_message": False,
+            "limit_message": (
+                "You have exceeded my daily download limit of %limit% files. "
+                "%ban_notice% %unban_notice%"
+            ),
             "auto_unban": False,
             "unban_after_days": 7,
         }
@@ -56,6 +61,20 @@ class Plugin(BasePlugin):
                 "description": "Do not count downloads from users in the buddy list",
                 "group": "Exceptions",
                 "type": "bool",
+            },
+            "send_limit_message": {
+                "description": "Send a private message when a user exceeds the limit",
+                "group": "Automatic Message",
+                "type": "bool",
+            },
+            "limit_message": {
+                "description": (
+                    "Private message sent when the limit is exceeded. Placeholders: "
+                    "%user%, %limit%, %count%, %ban_notice%, %unban_notice%, "
+                    "%unban_days%, %unban_at%"
+                ),
+                "group": "Automatic Message",
+                "type": "textview",
             },
             "auto_unban": {
                 "description": "Automatically remove bans created by this plugin",
@@ -309,6 +328,7 @@ class Plugin(BasePlugin):
 
     def _enforce_bans(self, username, ip_address):
         actions = []
+        ban_active = False
         managed_components = {
             "username": False,
             "ip": False,
@@ -317,10 +337,12 @@ class Plugin(BasePlugin):
 
         if self.settings.get("ban_username", True):
             try:
-                if not network_filter.is_user_banned(username):
+                is_username_banned = network_filter.is_user_banned(username)
+                if not is_username_banned:
                     network_filter.ban_user(username)
                     actions.append("username banned")
                     managed_components["username"] = True
+                ban_active = True
             except Exception as error:
                 self.log("Could not ban username %s: %s", (username, error))
 
@@ -340,11 +362,156 @@ class Plugin(BasePlugin):
                         "IP banned" if ip_address else "IP ban requested"
                     )
                     managed_components["ip"] = True
+                ban_active = True
 
             except Exception as error:
                 self.log("Could not ban the IP address for %s: %s", (username, error))
 
-        return actions, managed_components
+        return actions, managed_components, ban_active
+
+    def _get_remaining_user_uploads(self, username):
+        try:
+            uploads = self.core.uploads
+        except AttributeError:
+            return []
+
+        remaining_uploads = []
+        seen_uploads = set()
+
+        for collection_name in ("active_users", "queued_users", "failed_users"):
+            collection = getattr(uploads, collection_name, {})
+            try:
+                user_uploads = collection.get(username, {})
+                values = user_uploads.values()
+            except AttributeError:
+                continue
+
+            for upload in list(values):
+                upload_id = id(upload)
+                if upload_id in seen_uploads:
+                    continue
+
+                seen_uploads.add(upload_id)
+                remaining_uploads.append(upload)
+
+        return remaining_uploads
+
+    def _cancel_remaining_uploads_after_ban(self, username):
+        remaining_uploads = self._get_remaining_user_uploads(username)
+        if not remaining_uploads:
+            return True
+
+        try:
+            self.core.uploads.clear_uploads(
+                uploads=remaining_uploads,
+                denied_message="Banned",
+            )
+        except Exception as error:
+            self.log(
+                "Could not clear remaining uploads for banned user %s: %s",
+                (username, error),
+            )
+            return False
+
+        still_remaining = self._get_remaining_user_uploads(username)
+        if still_remaining:
+            self.log(
+                "%d uploads still remain for banned user %s after cancellation.",
+                (len(still_remaining), username),
+            )
+            return False
+
+        self.log(
+            "Cleared %d remaining queued, active, or failed uploads for banned user %s.",
+            (len(remaining_uploads), username),
+        )
+        return True
+
+    def _get_scheduled_unban_time_locked(self, username):
+        if not self.settings.get("auto_unban", False):
+            return None
+
+        managed_bans = self._state.get("managed_bans", {})
+        managed_record = managed_bans.get(username)
+        if not managed_record:
+            return None
+
+        banned_at = self._parse_utc_timestamp(managed_record.get("banned_at"))
+        if banned_at is None:
+            return None
+
+        return banned_at + timedelta(days=self.settings["unban_after_days"])
+
+    def _send_limit_message_locked(
+        self,
+        username,
+        count,
+        ban_active,
+        queue_cleared,
+    ):
+        if not self.settings.get("send_limit_message", False):
+            return
+
+        message = self.settings.get("limit_message", "")
+        if not isinstance(message, str) or not message.strip():
+            return
+
+        scheduled_unban = self._get_scheduled_unban_time_locked(username)
+        if scheduled_unban is not None:
+            unban_at = scheduled_unban.astimezone(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
+            unban_days = str(self.settings["unban_after_days"])
+            unban_notice = f"Automatic unban is scheduled for {unban_at}."
+        else:
+            unban_at = "not scheduled"
+            unban_days = "not scheduled"
+            unban_notice = "Automatic unban is not scheduled."
+
+        if ban_active and queue_cleared:
+            ban_notice = (
+                "You have been banned, and any remaining queued downloads "
+                "were cancelled."
+            )
+        elif ban_active:
+            ban_notice = (
+                "You have been banned, but some queued downloads could not "
+                "be cancelled."
+            )
+        else:
+            ban_notice = "No automatic ban action is enabled."
+
+        replacements = {
+            "%user%": username,
+            "%limit%": str(self.settings["daily_file_limit"]),
+            "%count%": str(count),
+            "%ban_notice%": ban_notice,
+            "%unban_notice%": unban_notice,
+            "%unban_days%": unban_days,
+            "%unban_at%": unban_at,
+        }
+
+        for placeholder, value in replacements.items():
+            message = message.replace(placeholder, value)
+
+        for line in message.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                self.send_private(
+                    username,
+                    line,
+                    show_ui=False,
+                    switch_page=False,
+                )
+            except Exception as error:
+                self.log(
+                    "Could not send the limit message to %s: %s",
+                    (username, error),
+                )
+                return
 
     def _record_managed_ban_locked(self, username, managed_components):
         if not any(managed_components.values()):
@@ -498,7 +665,7 @@ class Plugin(BasePlugin):
             limit = self.settings["daily_file_limit"]
 
             if count > limit:
-                actions, managed_components = self._enforce_bans(
+                actions, managed_components, ban_active = self._enforce_bans(
                     user,
                     ip_address,
                 )
@@ -509,11 +676,25 @@ class Plugin(BasePlugin):
                     managed_components,
                 )
 
+                queue_cleared = (
+                    self._cancel_remaining_uploads_after_ban(user)
+                    if ban_active
+                    else True
+                )
+
                 if first_enforcement or actions:
                     action_text = ", ".join(actions) if actions else "already banned"
                     self.log(
                         "Daily limit exceeded by %s after %d completed files (%s).",
                         (user, count, action_text),
+                    )
+
+                if first_enforcement:
+                    self._send_limit_message_locked(
+                        user,
+                        count,
+                        ban_active,
+                        queue_cleared,
                     )
 
                 if managed_ban_added:

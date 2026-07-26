@@ -13,7 +13,10 @@ its current IP address.
 - Resets counters when the machine's local calendar date changes.
 - Persists the current day's counters across Nicotine+ restarts.
 - Uses Nicotine+'s native username and IP ban lists.
+- Verifies that all of the banned user's queued, active, and failed uploads are
+  cleared after enforcement.
 - Can optionally exempt users in your buddy list.
+- Can optionally send a private message when the limit is exceeded.
 - Can optionally remove plugin-created bans after a configurable number of days.
 
 By default, bans remain in Nicotine+ until you remove them. Automatic unban is
@@ -49,12 +52,28 @@ Open the plugin's settings in Nicotine+ to configure:
 - **Ban username** — enabled by default.
 - **Ban IP address** — enabled by default.
 - **Exempt buddies** — disabled by default.
+- **Send a private message** — disabled by default.
+- **Limit message** — configurable text supporting the placeholders listed
+  below.
 - **Automatically remove plugin-created bans** — disabled by default.
 - **Unban after days** — defaults to `7` and uses 24-hour periods from the time
   the ban was applied.
 
 The limit is literal: with the default value, file 20 is allowed and file 21
 triggers the ban.
+
+### Message placeholders
+
+- `%user%` — the Soulseek username.
+- `%limit%` — the configured daily limit.
+- `%count%` — the completed-file count that triggered enforcement.
+- `%ban_notice%` — whether a ban was applied and queued downloads were
+  cancelled.
+- `%unban_notice%` — a complete automatic-unban status sentence.
+- `%unban_days%` — the configured number of days, or `not scheduled`.
+- `%unban_at%` — the scheduled timestamp in UTC, or `not scheduled`.
+
+The message is sent only once per user for the current daily counter window.
 
 ## State and privacy
 
@@ -72,9 +91,10 @@ Run the test suite with:
 python -B -m unittest discover -s tests -v
 ```
 
-The tests cover the default threshold, username/IP enforcement, persistence
-across restarts, local-day rollover, buddy exemptions, timed automatic unban,
-and protection for pre-existing manual bans.
+The tests cover the default threshold, username/IP enforcement, queue
+cancellation, automatic messages, persistence across restarts, local-day
+rollover, buddy exemptions, timed automatic unban, and protection for
+pre-existing manual bans.
 
 ## License
 

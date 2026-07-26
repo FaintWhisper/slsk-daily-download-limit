@@ -18,9 +18,15 @@ class FakeBasePlugin:
 
     def __init__(self, *args, **kwargs):
         self.logs = []
+        self.private_messages = []
 
     def log(self, message, args=None):
         self.logs.append((message, args))
+
+    def send_private(self, username, message, show_ui=True, switch_page=True):
+        self.private_messages.append(
+            (username, message, show_ui, switch_page)
+        )
 
 
 class FakeNetworkFilter:
@@ -65,11 +71,36 @@ class FakeNetworkFilter:
                 del self.banned_ips[saved_ip]
 
 
+class FakeUploads:
+    def __init__(self):
+        self.active_users = {}
+        self.queued_users = {}
+        self.failed_users = {}
+        self.clear_calls = []
+
+    def clear_uploads(self, uploads=None, denied_message=None):
+        uploads = list(uploads or [])
+        self.clear_calls.append((uploads, denied_message))
+
+        for collection in (
+            self.active_users,
+            self.queued_users,
+            self.failed_users,
+        ):
+            for username, user_uploads in list(collection.items()):
+                for key, upload in list(user_uploads.items()):
+                    if upload in uploads:
+                        del user_uploads[key]
+                if not user_uploads:
+                    del collection[username]
+
+
 class FakeCore:
     def __init__(self):
         self.network_filter = FakeNetworkFilter()
         self.users = types.SimpleNamespace(addresses={})
         self.buddies = types.SimpleNamespace(users={})
+        self.uploads = FakeUploads()
 
 
 def load_plugin_module():
@@ -264,6 +295,50 @@ class DailyDownloadLimitTests(unittest.TestCase):
 
         self.assertEqual(1, self.plugin._state["users"]["bob"]["count"])
         self.assertIn("alice", self.plugin._state["managed_bans"])
+
+    def test_remaining_user_uploads_are_cleared_after_the_ban(self):
+        alice_active = types.SimpleNamespace(username="alice")
+        alice_queued = types.SimpleNamespace(username="alice")
+        alice_failed = types.SimpleNamespace(username="alice")
+        bob_queued = types.SimpleNamespace(username="bob")
+        uploads = self.plugin.core.uploads
+        uploads.active_users["alice"] = {"active": alice_active}
+        uploads.queued_users["alice"] = {"queued": alice_queued}
+        uploads.failed_users["alice"] = {"failed": alice_failed}
+        uploads.queued_users["bob"] = {"queued": bob_queued}
+
+        for _ in range(21):
+            self.finish_upload()
+
+        cleared_uploads, denied_message = uploads.clear_calls[-1]
+        self.assertEqual(
+            {id(alice_active), id(alice_queued), id(alice_failed)},
+            {id(upload) for upload in cleared_uploads},
+        )
+        self.assertEqual("Banned", denied_message)
+        self.assertNotIn("alice", uploads.active_users)
+        self.assertNotIn("alice", uploads.queued_users)
+        self.assertNotIn("alice", uploads.failed_users)
+        self.assertIn("bob", uploads.queued_users)
+
+    def test_optional_limit_message_includes_scheduled_unban_time(self):
+        start = datetime(2099, 1, 1, 12, tzinfo=timezone.utc)
+        self.plugin._now_utc = lambda: start
+        self.plugin.settings["send_limit_message"] = True
+        self.plugin.settings["auto_unban"] = True
+        self.plugin.settings["unban_after_days"] = 3
+
+        for _ in range(22):
+            self.finish_upload()
+
+        self.assertEqual(1, len(self.plugin.private_messages))
+        username, message, show_ui, switch_page = self.plugin.private_messages[0]
+        self.assertEqual("alice", username)
+        self.assertIn("daily download limit of 20 files", message)
+        self.assertIn("remaining queued downloads were cancelled", message)
+        self.assertIn("2099-01-04 12:00 UTC", message)
+        self.assertFalse(show_ui)
+        self.assertFalse(switch_page)
 
 
 if __name__ == "__main__":

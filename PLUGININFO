@@ -1,4 +1,4 @@
-Version = "2026-07-26r01"
+Version = "2026-07-26r02"
 Authors = ["Amit Karamchandani Batra"]
 Name = "Daily Download Limit"
-Description = "Bans a username and its IP address after the user exceeds a daily download limit, with an optional timed automatic unban."
+Description = "Bans a username and IP after a daily download limit, clears remaining uploads, and optionally sends a message or automatically unbans later."
