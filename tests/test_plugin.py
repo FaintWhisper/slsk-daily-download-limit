@@ -4,6 +4,9 @@ import sys
 import types
 import unittest
 
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -26,6 +29,8 @@ class FakeNetworkFilter:
         self.banned_ips = {}
         self.user_ban_calls = []
         self.ip_ban_calls = []
+        self.user_unban_calls = []
+        self.ip_unban_calls = []
 
     def is_user_banned(self, username):
         return username in self.banned_users
@@ -33,6 +38,10 @@ class FakeNetworkFilter:
     def ban_user(self, username):
         self.user_ban_calls.append(username)
         self.banned_users.add(username)
+
+    def unban_user(self, username):
+        self.user_unban_calls.append(username)
+        self.banned_users.discard(username)
 
     def is_user_ip_banned(self, username=None, ip_address=None):
         return bool(
@@ -43,6 +52,17 @@ class FakeNetworkFilter:
     def ban_user_ip(self, username=None, ip_address=None):
         self.ip_ban_calls.append((username, ip_address))
         self.banned_ips[ip_address or f"? ({username})"] = username
+
+    def unban_user_ip(self, username=None, ip_address=None):
+        self.ip_unban_calls.append((username, ip_address))
+
+        if ip_address:
+            self.banned_ips.pop(ip_address, None)
+            return
+
+        for saved_ip, saved_username in list(self.banned_ips.items()):
+            if saved_username == username:
+                del self.banned_ips[saved_ip]
 
 
 class FakeCore:
@@ -81,6 +101,7 @@ class DailyDownloadLimitTests(unittest.TestCase):
         self.plugin.loaded_notification()
 
     def tearDown(self):
+        self.plugin.disable()
         self.temporary_directory.cleanup()
 
     def finish_upload(self, username="alice"):
@@ -149,6 +170,100 @@ class DailyDownloadLimitTests(unittest.TestCase):
         self.assertEqual("2099-01-02", state["date"])
         self.assertEqual(1, state["users"]["alice"]["count"])
         self.assertEqual([], self.plugin.core.network_filter.user_ban_calls)
+
+    def test_optional_auto_unban_removes_plugin_created_bans_after_x_days(self):
+        start = datetime(2099, 1, 1, 12, tzinfo=timezone.utc)
+        self.plugin.settings["auto_unban"] = True
+        self.plugin.settings["unban_after_days"] = 3
+        self.plugin._now_utc = lambda: start
+
+        for _ in range(21):
+            self.finish_upload()
+
+        with self.plugin._state_lock:
+            self.plugin._cancel_auto_unban_timer_locked()
+
+        self.plugin._now_utc = lambda: start + timedelta(days=3, seconds=1)
+        self.plugin._auto_unban_timer_callback()
+
+        network_filter = self.plugin.core.network_filter
+        self.assertEqual(["alice"], network_filter.user_unban_calls)
+        self.assertEqual([("alice", None)], network_filter.ip_unban_calls)
+        self.assertNotIn("alice", network_filter.banned_users)
+        self.assertEqual({}, network_filter.banned_ips)
+        self.assertNotIn("alice", self.plugin._state["managed_bans"])
+
+    def test_auto_unban_does_not_remove_preexisting_manual_bans(self):
+        network_filter = self.plugin.core.network_filter
+        network_filter.banned_users.add("alice")
+        network_filter.banned_ips["203.0.113.10"] = "alice"
+
+        self.plugin.settings["auto_unban"] = True
+        self.plugin.settings["unban_after_days"] = 1
+
+        for _ in range(21):
+            self.finish_upload()
+
+        self.assertEqual({}, self.plugin._state["managed_bans"])
+        self.assertEqual([], network_filter.user_unban_calls)
+        self.assertEqual([], network_filter.ip_unban_calls)
+
+    def test_auto_unban_ledger_survives_plugin_restart(self):
+        start = datetime(2099, 1, 1, 12, tzinfo=timezone.utc)
+        self.plugin._now_utc = lambda: start
+
+        for _ in range(21):
+            self.finish_upload()
+
+        restarted_plugin = PLUGIN_MODULE.Plugin()
+        restarted_plugin.path = self.temporary_directory.name
+        restarted_plugin.core = FakeCore()
+        restarted_filter = restarted_plugin.core.network_filter
+        restarted_filter.banned_users.add("alice")
+        restarted_filter.banned_ips["203.0.113.10"] = "alice"
+        restarted_plugin.settings["auto_unban"] = True
+        restarted_plugin.settings["unban_after_days"] = 2
+        restarted_plugin._now_utc = lambda: start + timedelta(days=2, seconds=1)
+
+        try:
+            restarted_plugin.loaded_notification()
+            self.assertEqual(["alice"], restarted_filter.user_unban_calls)
+            self.assertEqual([("alice", None)], restarted_filter.ip_unban_calls)
+            self.assertNotIn("alice", restarted_plugin._state["managed_bans"])
+        finally:
+            restarted_plugin.disable()
+
+    def test_enabling_auto_unban_after_a_ban_is_respected(self):
+        start = datetime(2099, 1, 1, 12, tzinfo=timezone.utc)
+        self.plugin._now_utc = lambda: start
+
+        for _ in range(21):
+            self.finish_upload()
+
+        with self.plugin._state_lock:
+            self.plugin._cancel_auto_unban_timer_locked()
+
+        self.plugin.settings["auto_unban"] = True
+        self.plugin.settings["unban_after_days"] = 1
+        self.plugin._now_utc = lambda: start + timedelta(days=1, seconds=1)
+        self.plugin._auto_unban_timer_callback()
+
+        network_filter = self.plugin.core.network_filter
+        self.assertEqual(["alice"], network_filter.user_unban_calls)
+        self.assertEqual([("alice", None)], network_filter.ip_unban_calls)
+
+    def test_plugin_managed_bans_survive_daily_counter_rollover(self):
+        for _ in range(21):
+            self.finish_upload()
+
+        self.assertIn("alice", self.plugin._state["managed_bans"])
+
+        self.plugin._today = lambda: "2099-01-02"
+        self.plugin.core.users.addresses["bob"] = ("203.0.113.11", 2234)
+        self.finish_upload("bob")
+
+        self.assertEqual(1, self.plugin._state["users"]["bob"]["count"])
+        self.assertIn("alice", self.plugin._state["managed_bans"])
 
 
 if __name__ == "__main__":

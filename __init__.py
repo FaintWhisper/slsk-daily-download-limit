@@ -7,7 +7,10 @@ import os
 import tempfile
 
 from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from threading import RLock
+from threading import Timer
 
 from pynicotine.pluginsystem import BasePlugin
 
@@ -15,7 +18,8 @@ from pynicotine.pluginsystem import BasePlugin
 class Plugin(BasePlugin):
 
     STATE_FILENAME = "daily_download_limit_state.json"
-    STATE_VERSION = 1
+    STATE_VERSION = 2
+    AUTO_UNBAN_CHECK_SECONDS = 3600
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -25,6 +29,8 @@ class Plugin(BasePlugin):
             "ban_username": True,
             "ban_ip_address": True,
             "exempt_buddies": False,
+            "auto_unban": False,
+            "unban_after_days": 7,
         }
         self.metasettings = {
             "daily_file_limit": {
@@ -51,21 +57,39 @@ class Plugin(BasePlugin):
                 "group": "Exceptions",
                 "type": "bool",
             },
+            "auto_unban": {
+                "description": "Automatically remove bans created by this plugin",
+                "group": "Automatic Unban",
+                "type": "bool",
+            },
+            "unban_after_days": {
+                "description": "Remove plugin-created bans after this many 24-hour days:",
+                "group": "Automatic Unban",
+                "type": "int",
+                "minimum": 1,
+                "maximum": 36500,
+            },
         }
 
         self._state_lock = RLock()
         self._state = self._new_state()
+        self._auto_unban_timer = None
 
     @staticmethod
     def _today():
         """Return the local calendar date used for the daily window."""
         return datetime.now().astimezone().date().isoformat()
 
-    def _new_state(self):
+    @staticmethod
+    def _now_utc():
+        return datetime.now(timezone.utc)
+
+    def _new_state(self, managed_bans=None):
         return {
             "version": self.STATE_VERSION,
             "date": self._today(),
             "users": {},
+            "managed_bans": managed_bans or {},
         }
 
     def _get_state_path(self):
@@ -83,8 +107,24 @@ class Plugin(BasePlugin):
             limit,
         )
 
+        try:
+            unban_after_days = int(self.settings.get("unban_after_days", 7))
+        except (TypeError, ValueError):
+            unban_after_days = 7
+
+        self.settings["unban_after_days"] = min(
+            self.metasettings["unban_after_days"]["maximum"],
+            max(
+                self.metasettings["unban_after_days"]["minimum"],
+                unban_after_days,
+            ),
+        )
+
         with self._state_lock:
             self._load_state_locked()
+            if self._process_expired_bans_locked():
+                self._save_state_locked()
+            self._schedule_auto_unban_locked()
 
         self.log(
             "Loaded. Users may download %d completed files per local calendar day; "
@@ -94,6 +134,16 @@ class Plugin(BasePlugin):
                 self.settings["daily_file_limit"] + 1,
             ),
         )
+
+        if self.settings.get("auto_unban", False):
+            self.log(
+                "Automatic unban is enabled after %d days for bans created by this plugin.",
+                self.settings["unban_after_days"],
+            )
+
+    def disable(self):
+        with self._state_lock:
+            self._cancel_auto_unban_timer_locked()
 
     def _load_state_locked(self):
         state_path = self._get_state_path()
@@ -111,12 +161,16 @@ class Plugin(BasePlugin):
             self._state = self._new_state()
             return
 
-        if not isinstance(raw_state, dict) or raw_state.get("date") != self._today():
+        if not isinstance(raw_state, dict):
             self._state = self._new_state()
             return
 
         clean_users = {}
-        raw_users = raw_state.get("users", {})
+        raw_users = (
+            raw_state.get("users", {})
+            if raw_state.get("date") == self._today()
+            else {}
+        )
 
         if isinstance(raw_users, dict):
             for username, raw_record in raw_users.items():
@@ -138,10 +192,34 @@ class Plugin(BasePlugin):
                     "ban_applied": bool(raw_record.get("ban_applied", False)),
                 }
 
+        clean_managed_bans = {}
+        raw_managed_bans = raw_state.get("managed_bans", {})
+
+        if isinstance(raw_managed_bans, dict):
+            for username, raw_record in raw_managed_bans.items():
+                if not isinstance(username, str) or not isinstance(raw_record, dict):
+                    continue
+
+                banned_at = raw_record.get("banned_at")
+                if self._parse_utc_timestamp(banned_at) is None:
+                    continue
+
+                username_ban = bool(raw_record.get("username", False))
+                ip_ban = bool(raw_record.get("ip", False))
+                if not username_ban and not ip_ban:
+                    continue
+
+                clean_managed_bans[username] = {
+                    "banned_at": banned_at,
+                    "username": username_ban,
+                    "ip": ip_ban,
+                }
+
         self._state = {
             "version": self.STATE_VERSION,
             "date": self._today(),
             "users": clean_users,
+            "managed_bans": clean_managed_bans,
         }
 
     def _save_state_locked(self):
@@ -188,8 +266,25 @@ class Plugin(BasePlugin):
         if self._state.get("date") == today:
             return
 
-        self._state = self._new_state()
+        self._state = self._new_state(
+            managed_bans=self._state.get("managed_bans", {}),
+        )
         self.log("Started a new daily download-count window for %s.", today)
+
+    @staticmethod
+    def _parse_utc_timestamp(value):
+        if not isinstance(value, str):
+            return None
+
+        try:
+            timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+        return timestamp.astimezone(timezone.utc)
 
     def _is_exempt_buddy(self, username):
         if not self.settings.get("exempt_buddies", False):
@@ -206,14 +301,18 @@ class Plugin(BasePlugin):
         except AttributeError:
             return ""
 
-        if not address:
+        if not isinstance(address, (list, tuple)) or not address:
             return ""
 
         ip_address = address[0]
         return ip_address if isinstance(ip_address, str) else ""
 
-    def _enforce_bans(self, username, ip_address, force_ip_ban=False):
+    def _enforce_bans(self, username, ip_address):
         actions = []
+        managed_components = {
+            "username": False,
+            "ip": False,
+        }
         network_filter = self.core.network_filter
 
         if self.settings.get("ban_username", True):
@@ -221,6 +320,7 @@ class Plugin(BasePlugin):
                 if not network_filter.is_user_banned(username):
                     network_filter.ban_user(username)
                     actions.append("username banned")
+                    managed_components["username"] = True
             except Exception as error:
                 self.log("Could not ban username %s: %s", (username, error))
 
@@ -231,7 +331,7 @@ class Plugin(BasePlugin):
                     ip_address=ip_address or None,
                 )
 
-                if force_ip_ban or not is_ip_banned:
+                if not is_ip_banned:
                     network_filter.ban_user_ip(
                         username=username,
                         ip_address=ip_address or None,
@@ -239,11 +339,136 @@ class Plugin(BasePlugin):
                     actions.append(
                         "IP banned" if ip_address else "IP ban requested"
                     )
+                    managed_components["ip"] = True
 
             except Exception as error:
                 self.log("Could not ban the IP address for %s: %s", (username, error))
 
-        return actions
+        return actions, managed_components
+
+    def _record_managed_ban_locked(self, username, managed_components):
+        if not any(managed_components.values()):
+            return False
+
+        managed_bans = self._state.setdefault("managed_bans", {})
+        record = managed_bans.get(username)
+
+        if record is None:
+            record = {
+                "banned_at": self._now_utc().isoformat(),
+                "username": False,
+                "ip": False,
+            }
+            managed_bans[username] = record
+
+        record["username"] = (
+            record.get("username", False)
+            or managed_components["username"]
+        )
+        record["ip"] = (
+            record.get("ip", False)
+            or managed_components["ip"]
+        )
+        return True
+
+    def _process_expired_bans_locked(self):
+        if not self.settings.get("auto_unban", False):
+            return False
+
+        managed_bans = self._state.get("managed_bans", {})
+        if not managed_bans:
+            return False
+
+        cutoff = self._now_utc() - timedelta(
+            days=self.settings["unban_after_days"],
+        )
+        network_filter = self.core.network_filter
+        state_changed = False
+
+        for username, record in list(managed_bans.items()):
+            banned_at = self._parse_utc_timestamp(record.get("banned_at"))
+            if banned_at is None or banned_at > cutoff:
+                continue
+
+            actions = []
+
+            if record.get("username", False):
+                try:
+                    if network_filter.is_user_banned(username):
+                        network_filter.unban_user(username)
+                        actions.append("username unbanned")
+                    record["username"] = False
+                    state_changed = True
+                except Exception as error:
+                    self.log("Could not auto-unban username %s: %s", (username, error))
+
+            if record.get("ip", False):
+                try:
+                    if network_filter.is_user_ip_banned(username=username):
+                        network_filter.unban_user_ip(username=username)
+                        actions.append("IP unbanned")
+                    record["ip"] = False
+                    state_changed = True
+                except Exception as error:
+                    self.log("Could not auto-unban the IP for %s: %s", (username, error))
+
+            if not record.get("username", False) and not record.get("ip", False):
+                del managed_bans[username]
+                state_changed = True
+
+                action_text = ", ".join(actions) if actions else "bans already absent"
+                self.log(
+                    "Automatic unban period expired for %s (%s).",
+                    (username, action_text),
+                )
+
+        return state_changed
+
+    def _cancel_auto_unban_timer_locked(self):
+        timer = self._auto_unban_timer
+        self._auto_unban_timer = None
+
+        if timer is not None:
+            timer.cancel()
+
+    def _schedule_auto_unban_locked(self):
+        self._cancel_auto_unban_timer_locked()
+
+        managed_bans = self._state.get("managed_bans", {})
+        if not managed_bans:
+            return
+
+        now = self._now_utc()
+        due_times = []
+
+        if self.settings.get("auto_unban", False):
+            for record in managed_bans.values():
+                banned_at = self._parse_utc_timestamp(record.get("banned_at"))
+                if banned_at is not None:
+                    due_times.append(
+                        banned_at + timedelta(days=self.settings["unban_after_days"])
+                    )
+
+        delay = self.AUTO_UNBAN_CHECK_SECONDS
+
+        if due_times:
+            remaining = (min(due_times) - now).total_seconds()
+            if remaining > 0:
+                delay = min(delay, remaining)
+
+        timer = Timer(max(1, delay), self._auto_unban_timer_callback)
+        timer.daemon = True
+        self._auto_unban_timer = timer
+        timer.start()
+
+    def _auto_unban_timer_callback(self):
+        with self._state_lock:
+            self._auto_unban_timer = None
+
+            if self._process_expired_bans_locked():
+                self._save_state_locked()
+
+            self._schedule_auto_unban_locked()
 
     def upload_finished_notification(self, user, virtual_path, real_path):
         """Count a file after another user finishes downloading it from us."""
@@ -264,7 +489,6 @@ class Plugin(BasePlugin):
             )
 
             ip_address = self._get_known_ip_address(user)
-            previous_ip = record.get("last_ip", "")
 
             record["count"] += 1
             if ip_address:
@@ -274,16 +498,16 @@ class Plugin(BasePlugin):
             limit = self.settings["daily_file_limit"]
 
             if count > limit:
-                actions = self._enforce_bans(
+                actions, managed_components = self._enforce_bans(
                     user,
                     ip_address,
-                    force_ip_ban=(
-                        not record.get("ban_applied", False)
-                        or bool(ip_address and ip_address != previous_ip)
-                    ),
                 )
                 first_enforcement = not record.get("ban_applied", False)
                 record["ban_applied"] = True
+                managed_ban_added = self._record_managed_ban_locked(
+                    user,
+                    managed_components,
+                )
 
                 if first_enforcement or actions:
                     action_text = ", ".join(actions) if actions else "already banned"
@@ -291,5 +515,8 @@ class Plugin(BasePlugin):
                         "Daily limit exceeded by %s after %d completed files (%s).",
                         (user, count, action_text),
                     )
+
+                if managed_ban_added:
+                    self._schedule_auto_unban_locked()
 
             self._save_state_locked()

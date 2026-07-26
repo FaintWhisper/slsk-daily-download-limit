@@ -14,9 +14,11 @@ its current IP address.
 - Persists the current day's counters across Nicotine+ restarts.
 - Uses Nicotine+'s native username and IP ban lists.
 - Can optionally exempt users in your buddy list.
+- Can optionally remove plugin-created bans after a configurable number of days.
 
-The resulting bans are not automatically removed at midnight. They remain in
-Nicotine+ until you remove them.
+By default, bans remain in Nicotine+ until you remove them. Automatic unban is
+opt-in and never removes bans that already existed before this plugin enforced
+the download limit.
 
 ## Installation
 
@@ -47,6 +49,9 @@ Open the plugin's settings in Nicotine+ to configure:
 - **Ban username** — enabled by default.
 - **Ban IP address** — enabled by default.
 - **Exempt buddies** — disabled by default.
+- **Automatically remove plugin-created bans** — disabled by default.
+- **Unban after days** — defaults to `7` and uses 24-hour periods from the time
+  the ban was applied.
 
 The limit is literal: with the default value, file 20 is allowed and file 21
 triggers the ban.
@@ -55,8 +60,9 @@ triggers the ban.
 
 The plugin creates `daily_download_limit_state.json` in its installed folder.
 It stores the current date, usernames, completed-file counts, enforcement
-status, and the last IP address seen for each user. The state file is replaced
-atomically after each completed transfer.
+status, the last IP address seen for each user, and timestamps for bans managed
+by the optional automatic-unban feature. The state file is replaced atomically
+after each completed transfer.
 
 ## Development
 
@@ -67,7 +73,8 @@ python -B -m unittest discover -s tests -v
 ```
 
 The tests cover the default threshold, username/IP enforcement, persistence
-across restarts, local-day rollover, and buddy exemptions.
+across restarts, local-day rollover, buddy exemptions, timed automatic unban,
+and protection for pre-existing manual bans.
 
 ## License
 
