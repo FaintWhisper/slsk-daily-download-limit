@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+daily_download_limit_state.json
+.daily_download_limit_*.tmp

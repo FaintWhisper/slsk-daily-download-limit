@@ -1,0 +1,4 @@
+Version = "2026-07-26r00"
+Authors = ["Amit Karamchandani Batra"]
+Name = "Daily Download Limit"
+Description = "Bans a username and its IP address after the user downloads more than a configured number of files in one local calendar day."
