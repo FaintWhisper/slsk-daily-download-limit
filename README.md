@@ -81,7 +81,8 @@ The plugin creates `daily_download_limit_state.json` in its installed folder.
 It stores the current date, usernames, completed-file counts, enforcement
 status, the last IP address seen for each user, and timestamps for bans managed
 by the optional automatic-unban feature. The state file is replaced atomically
-after each completed transfer.
+after each completed transfer using a fixed sibling temporary file. This avoids
+platform-specific failures allocating randomized temporary filenames.
 
 ## Development
 

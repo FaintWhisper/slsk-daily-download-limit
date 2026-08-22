@@ -4,7 +4,6 @@
 
 import json
 import os
-import tempfile
 
 from datetime import datetime
 from datetime import timedelta
@@ -244,18 +243,14 @@ class Plugin(BasePlugin):
     def _save_state_locked(self):
         state_path = self._get_state_path()
         state_folder = os.path.dirname(state_path)
-        temporary_path = None
+        temporary_path = os.path.join(
+            state_folder,
+            ".daily_download_limit_state.tmp",
+        )
 
         try:
             os.makedirs(state_folder, exist_ok=True)
-            file_descriptor, temporary_path = tempfile.mkstemp(
-                prefix=".daily_download_limit_",
-                suffix=".tmp",
-                dir=state_folder,
-                text=True,
-            )
-
-            with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="\n") as state_file:
+            with open(temporary_path, "w", encoding="utf-8", newline="\n") as state_file:
                 json.dump(
                     self._state,
                     state_file,
@@ -268,17 +263,19 @@ class Plugin(BasePlugin):
                 os.fsync(state_file.fileno())
 
             os.replace(temporary_path, state_path)
-            temporary_path = None
 
         except OSError as error:
             self.log("Could not save daily counter state: %s", error)
 
         finally:
-            if temporary_path:
-                try:
-                    os.unlink(temporary_path)
-                except OSError:
-                    pass
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # A leftover sibling file is harmless and will be overwritten
+                # by the next serialized state save.
+                pass
 
     def _roll_over_day_locked(self):
         today = self._today()

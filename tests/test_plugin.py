@@ -202,6 +202,20 @@ class DailyDownloadLimitTests(unittest.TestCase):
         self.assertEqual(1, state["users"]["alice"]["count"])
         self.assertEqual([], self.plugin.core.network_filter.user_ban_calls)
 
+    def test_state_save_overwrites_a_stale_fixed_temporary_file(self):
+        temporary_path = (
+            Path(self.temporary_directory.name)
+            / ".daily_download_limit_state.tmp"
+        )
+        temporary_path.write_text("stale state", encoding="utf-8")
+
+        self.finish_upload()
+
+        state_path = Path(self.temporary_directory.name) / self.plugin.STATE_FILENAME
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(1, state["users"]["alice"]["count"])
+        self.assertFalse(temporary_path.exists())
+
     def test_optional_auto_unban_removes_plugin_created_bans_after_x_days(self):
         start = datetime(2099, 1, 1, 12, tzinfo=timezone.utc)
         self.plugin.settings["auto_unban"] = True
